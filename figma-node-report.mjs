@@ -2,8 +2,8 @@
 /**
  * Figma Node Analyzer -> Markdown
  *
- * - Token via env var: FIGMA_TOKEN
- * - Input: Figma node URL containing node-id
+ * - Token + URL via .env (FIGMA_TOKEN + FIGMA_URL)
+ * - Input URL must contain node-id
  * - Output: figma-report/figma-node-report.md + one section per top-level child
  *
  * Notes:
@@ -17,16 +17,65 @@ import path from 'node:path'
 
 const FIGMA_API = 'https://api.figma.com/v1'
 
-function usage(exitCode = 0) {
-    const msg = `
-Usage:
-  FIGMA_TOKEN=... node figma-node-report.mjs <figma-node-url> [options]
+async function loadDotEnv({ cwd, verbose }) {
+  const envPath = path.join(cwd, '.env')
+  let raw
+  try {
+    raw = await fs.readFile(envPath, 'utf8')
+  } catch {
+    throw new Error(`Missing .env file at: ${envPath}`)
+  }
 
-Required:
-  - FIGMA_TOKEN env var
-  - <figma-node-url> must contain /file/<FILEKEY>/ or /design/<FILEKEY>/ and ?node-id=...
+  const lines = raw.split(/\r?\n/)
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    const trimmed = line.trim()
+    if (!trimmed || trimmed.startsWith('#')) continue
+
+    const eq = trimmed.indexOf('=')
+    if (eq === -1) continue
+
+    const key = trimmed.slice(0, eq).trim()
+    let value = trimmed.slice(eq + 1).trim()
+
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1)
+    }
+
+    // Allow common backslash escapes sometimes used in .env values.
+    // Example: "...\?node-id\=123-456\&t\=..." -> "...?node-id=123-456&t=..."
+    value = value
+      .replace(/\\\?/g, '?')
+      .replace(/\\=/g, '=')
+      .replace(/\\&/g, '&')
+      .replace(/\\:/g, ':')
+      .replace(/\\\//g, '/')
+
+    // Don't overwrite real env vars.
+    if (process.env[key] == null) process.env[key] = value
+  }
+
+  if (verbose) {
+    // eslint-disable-next-line no-console
+    console.log(`Loaded .env: ${envPath}`)
+  }
+}
+
+function usage(exitCode = 0) {
+  const msg = `
+Usage:
+  node figma-node-report.mjs [options]
+
+Inputs:
+  - Reads .env from the current directory
+  - Requires FIGMA_TOKEN and FIGMA_URL (or FIGMA_NODE_URL)
+
+Figma URL requirements:
+  - Must contain /file/<FILEKEY>/ or /design/<FILEKEY>/
+  - Must include ?node-id=...
 
 Options:
+  --url <figma-node-url> Override FIGMA_URL for this run
   --out-dir <dir>        Output directory (default: figma-report)
   --section-dir <dir>    Section directory under out-dir (default: sections)
   --batch-size <n>       Node ids per API request (default: 50)
@@ -35,8 +84,8 @@ Options:
   --help                 Show help
 
 Examples:
-  FIGMA_TOKEN=... node figma-node-report.mjs "https://www.figma.com/file/ABC123/Design?node-id=123%3A456"
-  FIGMA_TOKEN=... node figma-node-report.mjs "..." --out-dir out --concurrency 2 --batch-size 40
+  node figma-node-report.mjs
+  node figma-node-report.mjs --url "https://www.figma.com/design/ABC123/Design?node-id=123-456"
 `.trim()
     // eslint-disable-next-line no-console
     console.log(msg)
@@ -44,63 +93,67 @@ Examples:
 }
 
 function parseArgs(argv) {
-    const args = {
-        url: null,
-        outDir: 'figma-report',
-        sectionDir: 'sections',
-        batchSize: 50,
-        concurrency: 3,
-        verbose: false,
+  const args = {
+    url: null,
+    outDir: 'figma-report',
+    sectionDir: 'sections',
+    batchSize: 50,
+    concurrency: 3,
+    verbose: false,
+  }
+
+  const positionals = []
+  for (let i = 2; i < argv.length; i++) {
+    const a = argv[i]
+    if (a === '--help' || a === '-h') usage(0)
+    if (a === '--verbose') {
+      args.verbose = true
+      continue
     }
 
-    const positionals = []
-    for (let i = 2; i < argv.length; i++) {
-        const a = argv[i]
-        if (a === '--help' || a === '-h') usage(0)
-        if (a === '--verbose') {
-            args.verbose = true
-            continue
-        }
-
-        if (a.startsWith('--')) {
-            const key = a.slice(2)
-            const v = argv[i + 1]
-            if (!v || v.startsWith('--')) {
-                // eslint-disable-next-line no-console
-                console.error(`Missing value for --${key}`)
-                usage(1)
-            }
-            i++
-            if (key === 'out-dir') args.outDir = v
-            else if (key === 'section-dir') args.sectionDir = v
-            else if (key === 'batch-size') args.batchSize = Number(v)
-            else if (key === 'concurrency') args.concurrency = Number(v)
-            else {
-                // eslint-disable-next-line no-console
-                console.error(`Unknown flag: --${key}`)
-                usage(1)
-            }
-            continue
-        }
-
-        positionals.push(a)
-    }
-
-    if (positionals.length !== 1) usage(1)
-    args.url = positionals[0]
-
-    if (!Number.isFinite(args.batchSize) || args.batchSize <= 0) {
+    if (a.startsWith('--')) {
+      const key = a.slice(2)
+      const v = argv[i + 1]
+      if (!v || v.startsWith('--')) {
         // eslint-disable-next-line no-console
-        console.error(`Invalid --batch-size: ${args.batchSize}`)
-        process.exit(1)
-    }
-    if (!Number.isFinite(args.concurrency) || args.concurrency <= 0) {
+        console.error(`Missing value for --${key}`)
+        usage(1)
+      }
+      i++
+      if (key === 'url') args.url = v
+      else if (key === 'out-dir') args.outDir = v
+      else if (key === 'section-dir') args.sectionDir = v
+      else if (key === 'batch-size') args.batchSize = Number(v)
+      else if (key === 'concurrency') args.concurrency = Number(v)
+      else {
         // eslint-disable-next-line no-console
-        console.error(`Invalid --concurrency: ${args.concurrency}`)
-        process.exit(1)
+        console.error(`Unknown flag: --${key}`)
+        usage(1)
+      }
+      continue
     }
 
-    return args
+    positionals.push(a)
+  }
+
+  if (positionals.length > 0) {
+    // eslint-disable-next-line no-console
+    console.error('This script no longer accepts a positional URL argument. Use --url or set FIGMA_URL in .env')
+    usage(1)
+  }
+
+  if (!Number.isFinite(args.batchSize) || args.batchSize <= 0) {
+    // eslint-disable-next-line no-console
+    console.error(`Invalid --batch-size: ${args.batchSize}`)
+    process.exit(1)
+  }
+  if (!Number.isFinite(args.concurrency) || args.concurrency <= 0) {
+    // eslint-disable-next-line no-console
+    console.error(`Invalid --concurrency: ${args.concurrency}`)
+    process.exit(1)
+  }
+
+  return args
 }
 
 function log(verbose, ...parts) {
@@ -133,8 +186,22 @@ function parseFigmaNodeUrl(urlStr) {
   if (!m) throw new Error(`Could not find file key in URL path: ${url.pathname}`)
   const fileKey = m[1]
 
-  const nodeIdParam = url.searchParams.get('node-id') || url.searchParams.get('node_id')
-  if (!nodeIdParam) throw new Error('URL missing required query param: node-id')
+  let nodeIdParam = url.searchParams.get('node-id') || url.searchParams.get('node_id')
+
+  // Some share URLs can put params in the hash fragment; support that too.
+  if (!nodeIdParam) {
+    const hash = url.hash ? url.hash.replace(/^#/, '') : ''
+    const combined = `${url.search || ''}&${hash}`.replace(/^\?/, '')
+    const more = new URLSearchParams(combined)
+    nodeIdParam = more.get('node-id') || more.get('node_id')
+  }
+
+  if (!nodeIdParam) {
+    throw new Error(
+      'URL missing required query param: node-id\n' +
+        'Tip: ensure FIGMA_URL includes something like ?node-id=123-456 (or ?node-id=123%3A456).',
+    )
+  }
 
   // node-id may be urlencoded (e.g. 123%3A456) or dash-separated (e.g. 123-456)
   let nodeId = decodeURIComponent(nodeIdParam)
@@ -834,15 +901,25 @@ function inventoryMarkdown(inventories) {
 }
 
 async function main() {
-    const args = parseArgs(process.argv)
-    const token = process.env.FIGMA_TOKEN
-    if (!token) {
-        // eslint-disable-next-line no-console
-        console.error('Missing FIGMA_TOKEN env var')
-        process.exit(1)
-    }
+  const args = parseArgs(process.argv)
 
-    const { fileKey, nodeId } = parseFigmaNodeUrl(args.url)
+  await loadDotEnv({ cwd: process.cwd(), verbose: args.verbose })
+
+  const token = process.env.FIGMA_TOKEN
+  if (!token) {
+    // eslint-disable-next-line no-console
+    console.error('Missing FIGMA_TOKEN in .env (or environment)')
+    process.exit(1)
+  }
+
+  const url = args.url || process.env.FIGMA_URL || process.env.FIGMA_NODE_URL
+  if (!url) {
+    // eslint-disable-next-line no-console
+    console.error('Missing FIGMA_URL in .env (or pass --url)')
+    process.exit(1)
+  }
+
+  const { fileKey, nodeId } = parseFigmaNodeUrl(url)
 
     const outDirAbs = path.resolve(process.cwd(), args.outDir)
     const sectionDirAbs = path.join(outDirAbs, args.sectionDir)
